@@ -1,8 +1,9 @@
 "use client";
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useCallback } from "react";
 import { useModels, type ModelSortKey } from "@/hooks/useModels";
 import { useCatalog } from "@/hooks/useCatalog";
+import { catalogClient } from "@/lib/api";
 import { type CacheEfficiency } from "@/lib/cacheUtils";
 import { TimeRangeSelector } from "@/components/TimeRangeSelector";
 import { ScopeToggle } from "@/components/ScopeToggle";
@@ -111,8 +112,8 @@ export default function ModelsPage() {
 function CatalogTab() {
   const { models, source, adminEditable, loading, error, refresh } = useCatalog();
   const [search, setSearch] = useState("");
-  // NOTE: toggle is local-only in v1. Persistence via UpdateCatalogEntry comes in a follow-up.
-  const [enabledOverrides, setEnabledOverrides] = useState<Record<string, boolean>>({});
+  const [pendingOps, setPendingOps] = useState<Set<string>>(new Set());
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
     if (!search) return models;
@@ -126,19 +127,42 @@ function CatalogTab() {
     );
   }, [models, search]);
 
-  const getEnabled = (modelId: string, provider: string, defaultEnabled: boolean) => {
+  const toggleEnabled = useCallback(async (modelId: string, provider: string, currentEnabled: boolean) => {
     const key = `${provider}/${modelId}`;
-    return enabledOverrides[key] ?? defaultEnabled;
-  };
+    setPendingOps((prev) => new Set(prev).add(key));
+    setActionError(null);
+    try {
+      await catalogClient.updateModelCatalogEntry({
+        entry: { provider, modelId, enabled: !currentEnabled },
+        updateMask: { paths: ["enabled"] },
+      });
+      await refresh();
+    } catch (err) {
+      setActionError(`Failed to ${currentEnabled ? "disable" : "enable"} ${modelId}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setPendingOps((prev) => { const next = new Set(prev); next.delete(key); return next; });
+    }
+  }, [refresh]);
 
-  const toggleEnabled = (modelId: string, provider: string, currentEnabled: boolean) => {
+  const deleteEntry = useCallback(async (modelId: string, provider: string) => {
+    if (!confirm(`Delete ${provider}/${modelId} from catalog? This cannot be undone.`)) return;
     const key = `${provider}/${modelId}`;
-    setEnabledOverrides((prev) => ({ ...prev, [key]: !currentEnabled }));
-  };
+    setPendingOps((prev) => new Set(prev).add(key));
+    setActionError(null);
+    try {
+      await catalogClient.deleteModelCatalogEntry({ provider, modelId });
+      await refresh();
+    } catch (err) {
+      setActionError(`Failed to delete ${modelId}: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setPendingOps((prev) => { const next = new Set(prev); next.delete(key); return next; });
+    }
+  }, [refresh]);
 
   return (
     <>
       {error && <ErrorBanner title="Catalog Error">{error}</ErrorBanner>}
+      {actionError && <ErrorBanner title="Action Failed">{actionError}</ErrorBanner>}
 
       {/* Summary cards */}
       {loading && models.length === 0 ? (
@@ -242,11 +266,11 @@ function CatalogTab() {
                 <th style={{ textAlign: "right" }}>Output $/M</th>
                 <th style={{ textAlign: "right" }}>Context Window</th>
                 <th style={{ textAlign: "center" }}>Status</th>
+                {adminEditable && <th style={{ textAlign: "center" }}>Actions</th>}
               </tr>
             </thead>
             <tbody>
               {filtered.map((entry) => {
-                const enabled = getEnabled(entry.modelId, entry.provider, entry.enabled);
                 return (
                   <tr key={`${entry.provider}/${entry.modelId}`}>
                     <td>
@@ -301,12 +325,13 @@ function CatalogTab() {
                     <td style={{ textAlign: "center" }}>
                       {adminEditable ? (
                         <button
-                          className={`badge ${enabled ? "badge-success" : "badge-warning"}`}
-                          style={{ cursor: "pointer", border: "none" }}
-                          onClick={() => toggleEnabled(entry.modelId, entry.provider, enabled)}
-                          title={enabled ? "Click to disable" : "Click to enable"}
+                          className={`badge ${entry.enabled ? "badge-success" : "badge-warning"}`}
+                          style={{ cursor: pendingOps.has(`${entry.provider}/${entry.modelId}`) ? "wait" : "pointer", border: "none", opacity: pendingOps.has(`${entry.provider}/${entry.modelId}`) ? 0.5 : 1 }}
+                          onClick={() => toggleEnabled(entry.modelId, entry.provider, entry.enabled)}
+                          disabled={pendingOps.has(`${entry.provider}/${entry.modelId}`)}
+                          title={entry.enabled ? "Click to disable" : "Click to enable"}
                         >
-                          {enabled ? "Active" : "Disabled"}
+                          {entry.enabled ? "Active" : "Disabled"}
                         </button>
                       ) : (
                         <span
@@ -316,6 +341,19 @@ function CatalogTab() {
                         </span>
                       )}
                     </td>
+                    {adminEditable && (
+                      <td style={{ textAlign: "center" }}>
+                        <button
+                          className="badge badge-error"
+                          style={{ cursor: pendingOps.has(`${entry.provider}/${entry.modelId}`) ? "wait" : "pointer", border: "none", opacity: pendingOps.has(`${entry.provider}/${entry.modelId}`) ? 0.5 : 1, fontSize: 10 }}
+                          onClick={() => deleteEntry(entry.modelId, entry.provider)}
+                          disabled={pendingOps.has(`${entry.provider}/${entry.modelId}`)}
+                          title="Delete from catalog"
+                        >
+                          🗑 Delete
+                        </button>
+                      </td>
+                    )}
                   </tr>
                 );
               })}
