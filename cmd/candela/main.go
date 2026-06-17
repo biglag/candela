@@ -432,7 +432,7 @@ func cmdStatus() {
 func cmdDoctor() {
 	fix := len(os.Args) > 2 && os.Args[2] == "--fix"
 
-	port := resolvePort(nil)
+	port := resolvePort(os.Args[2:])
 	lmPort := 1234 // default LM Studio compat port
 	if cfg := loadConfig(""); cfg.LMStudioPort != 0 {
 		lmPort = cfg.LMStudioPort
@@ -476,9 +476,31 @@ func cmdDoctor() {
 		}
 	}
 
+	// Check if any conflicting process is managed by launchd (brew services).
+	launchdManaged := false
+	if !clean {
+		seen := make(map[int]bool)
+		for _, c := range conflicts {
+			if !seen[c.PID] && isLaunchdManaged(c.PID) {
+				launchdManaged = true
+				seen[c.PID] = true
+				fmt.Printf("ℹ️  PID %d is managed by launchd (brew services)\n", c.PID)
+			}
+		}
+	}
+
 	if clean {
 		fmt.Println("\n🩺 No port conflicts detected.")
 		return
+	}
+
+	if launchdManaged {
+		fmt.Println("\n⚠️  Conflicting process is managed by launchd.")
+		fmt.Println("   Killing it directly will cause launchd to respawn it.")
+		fmt.Println("   Use: brew services stop candela")
+		if !fix {
+			return
+		}
 	}
 
 	if !fix {
@@ -503,12 +525,37 @@ func cmdDoctor() {
 		fmt.Printf("🔪 killed PID %d (%s) on port %d\n", c.PID, c.Command, c.Port)
 	}
 
-	// Clean up stale PID file if present.
-	if pidPath := pidFilePath(); pidPath != "" {
-		_ = os.Remove(pidPath)
+	// Clean up stale PID file only if the tracked process is no longer running.
+	if pidPath := pidFilePath(); pidPath != "" && ownPID > 0 {
+		if proc, err := os.FindProcess(ownPID); err != nil || proc.Signal(syscall.Signal(0)) != nil {
+			_ = os.Remove(pidPath)
+		}
 	}
 
 	fmt.Println("\n✅ Ports cleared. Run 'candela start' to start fresh.")
+}
+
+// isLaunchdManaged checks whether a PID is managed by a launchd service
+// (e.g. homebrew.mxcl.candela). This is relevant because killing a
+// launchd-managed process will cause launchd to respawn it immediately.
+func isLaunchdManaged(pid int) bool {
+	// launchctl list outputs: PID\tStatus\tLabel
+	out, err := exec.Command("launchctl", "list").Output()
+	if err != nil {
+		return false
+	}
+	pidStr := strconv.Itoa(pid)
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && fields[0] == pidStr {
+			// Check for homebrew or candela service labels.
+			label := fields[2]
+			if strings.Contains(label, "candela") || strings.Contains(label, "homebrew") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // portProcessInfo holds info about a process listening on a port.
@@ -521,6 +568,11 @@ type portProcessInfo struct {
 func findProcessesOnPort(port int) []portProcessInfo {
 	out, err := exec.Command("lsof", "-i", fmt.Sprintf("tcp:%d", port), "-sTCP:LISTEN", "-n", "-P").Output()
 	if err != nil {
+		// lsof exits with code 1 when no matching processes are found — that's fine.
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "⚠️  Warning: failed to run 'lsof': %v. Port conflict detection may be incomplete.\n", err)
 		return nil
 	}
 
